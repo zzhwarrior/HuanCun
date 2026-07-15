@@ -23,6 +23,7 @@ import org.chipsalliance.cde.config.Parameters
 import chisel3._
 import chisel3.util._
 import freechips.rocketchip.diplomacy._
+import org.chipsalliance.diplomacy.bundlebridge.BundleBridgeNexusNode
 import freechips.rocketchip.tile.MaxHartIdBits
 import freechips.rocketchip.tilelink._
 import freechips.rocketchip.tilelink.TLMessages._
@@ -205,22 +206,23 @@ class HuanCun(implicit p: Parameters) extends LazyModule with HasHuanCunParamete
     managerFn = { m =>
       TLSlavePortParameters.v1(
         m.managers.map { m =>
+          val canCache = m.regionType >= RegionType.UNCACHED
           m.v2copy(
-            regionType = if (m.regionType >= RegionType.UNCACHED) RegionType.CACHED else m.regionType,
+            regionType = if (canCache) RegionType.CACHED else m.regionType,
             supports = TLMasterToSlaveTransferSizes(
-              acquireB = xfer,
-              acquireT = if (m.supportsAcquireT) xfer else TransferSizes.none,
-              arithmetic = if (m.supportsAcquireT) atom else TransferSizes.none,
-              logical = if (m.supportsAcquireT) atom else TransferSizes.none,
-              get = access,
-              putFull = if (m.supportsAcquireT) access else TransferSizes.none,
-              putPartial = if (m.supportsAcquireT) access else TransferSizes.none,
-              hint = access
+              acquireB = if (canCache) xfer else TransferSizes.none,
+              acquireT = if (canCache && m.supportsAcquireT) xfer else TransferSizes.none,
+              arithmetic = if (canCache && m.supportsAcquireT) atom else TransferSizes.none,
+              logical = if (canCache && m.supportsAcquireT) atom else TransferSizes.none,
+              get = if (m.supportsGet) access else TransferSizes.none,
+              putFull = if (m.supportsPutFull) access else TransferSizes.none,
+              putPartial = if (m.supportsPutPartial) access else TransferSizes.none,
+              hint = if (m.supportsHint) access else TransferSizes.none
             ),
             fifoId = None
           )
         },
-        beatBytes = 32,
+        beatBytes = cacheParams.channelBytes.d.get,
         minLatency = 2,
         responseFields = cacheParams.respField,
         requestKeys = cacheParams.reqKey,
@@ -360,7 +362,7 @@ class HuanCun(implicit p: Parameters) extends LazyModule with HasHuanCunParamete
 
     val slices = wrapper.node.in.zip(wrapper.node.out).zipWithIndex.map {
       case (((in, edgeIn), (out, edgeOut)), i) =>
-        require(in.params.dataBits == out.params.dataBits)
+        // in/out dataBits may differ when a TLWidthWidget is placed on the outer side
         val rst = if(cacheParams.level == 3 && !cacheParams.simulation) {
           ResetGen()
         } else reset

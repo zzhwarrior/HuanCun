@@ -588,8 +588,8 @@ class Slice()(implicit p: Parameters) extends HuanCunModule {
   })
   sinkD.io.way := sinkD_status.bits.way_reg
   sinkD.io.set := sinkD_status.bits.set
-  sinkD.io.inner_grant := sinkD_status.bits.will_grant_data
-  sinkD.io.save_data_in_bs := sinkD_status.bits.will_save_data
+  sinkD.io.inner_grant := sinkD_status.bits.will_grant_data && sinkD.io.d.valid
+  sinkD.io.save_data_in_bs := sinkD_status.bits.will_save_data && sinkD.io.d.valid
 
   sinkC.io.sourceD_r_hazard <> sourceD.io.sourceD_r_hazard
   sinkD.io.sourceD_r_hazard <> sourceD.io.sourceD_r_hazard

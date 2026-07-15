@@ -465,6 +465,7 @@ class MSHR()(implicit p: Parameters) extends BaseMSHR[DirResult, SelfDirWrite, S
   val sink = Reg(UInt(edgeOut.bundle.sinkBits.W))
 
   val bad_grant = RegInit(false.B)
+  val got_bypass_data = RegInit(false.B) // LLC response actually carried data for bypass
   // TODO: consider bad grant
   when(bad_grant) {
     new_self_dir.dirty := false.B
@@ -601,6 +602,7 @@ class MSHR()(implicit p: Parameters) extends BaseMSHR[DirResult, SelfDirWrite, S
     probe_dirty := false.B
     probes_done := 0.U
     bad_grant := false.B
+    got_bypass_data := false.B
     need_block_downwards := false.B
     inv_self_dir := false.B
     nested_c_hit_reg := false.B
@@ -1143,9 +1145,13 @@ class MSHR()(implicit p: Parameters) extends BaseMSHR[DirResult, SelfDirWrite, S
   oc.dirty := Mux(req.fromB, probe_dirty || self_meta.hit && self_meta.dirty, self_meta.dirty)
 
   od.sinkId := io.id
-  od.useBypass := (!self_meta.hit || self_meta.state === BRANCH && req_needT) &&
+  val bypass_miss_cond = (!self_meta.hit || self_meta.state === BRANCH && req_needT) &&
     (!probe_dirty && !nestC_save || acquire_flag && oa.opcode =/= AcquirePerm) &&
     !(meta_reg.self.error || meta_reg.clients.error) && !req_put
+  // useBypass is only valid once the LLC has confirmed it sent data into the RefillBuffer.
+  // bypass_miss_cond is kept separate so will_grant_data (used by SinkD inner_grant) remains
+  // true while waiting for the LLC response, enabling the RefillBuffer write when data arrives.
+  od.useBypass := bypass_miss_cond && got_bypass_data
   od.sourceId := req.source
   od.set := req.set
   od.tag := req.tag
@@ -1397,12 +1403,15 @@ class MSHR()(implicit p: Parameters) extends BaseMSHR[DirResult, SelfDirWrite, S
       sink := io.resps.sink_d.bits.sink
       w_grantfirst := true.B
       w_grantlast := w_grantlast || io.resps.sink_d.bits.last
-      w_grant := (req.off === 0.U && req.size === log2Ceil(blockBytes).U) || io.resps.sink_d.bits.last  // if req.off != 0, w_grant indicates all beats are acked
+      w_grant := (req.off === 0.U && req.size === log2Ceil(blockBytes).U) || io.resps.sink_d.bits.last
       bad_grant := io.resps.sink_d.bits.denied
       gotT := io.resps.sink_d.bits.param === toT
       gotDirty := io.resps.sink_d.bits.dirty
       when (!req_put) {
-        req.bufIdx := io.resps.sink_d.bits.bufIdx
+        when (io.resps.sink_d.bits.opcode(0)) {
+          req.bufIdx := io.resps.sink_d.bits.bufIdx
+          got_bypass_data := true.B
+        }
       }
     }
     when(io.resps.sink_d.bits.opcode === ReleaseAck) {
@@ -1475,10 +1484,8 @@ class MSHR()(implicit p: Parameters) extends BaseMSHR[DirResult, SelfDirWrite, S
     req := io.alloc.bits
     req.alias.foreach(_ := io.alloc.bits.alias.get)
     val clientBitOH = getClientBitOH(io.alloc.bits.source)
-    // The highest bit of iam indicates that req comes from TL-UL node
     iam := Mux(clientBitOH === 0.U, Cat(1.U(1.W), 0.U(log2Up(clientBits).W)), OHToUInt(clientBitOH))
   }
-
   // Latched control signals for timing
   val cache_alias_latch = RegNext(cache_alias, false.B)
   val preferCache_latch = RegNext(preferCache, false.B)
@@ -1492,7 +1499,10 @@ class MSHR()(implicit p: Parameters) extends BaseMSHR[DirResult, SelfDirWrite, S
   io.status.bits.is_miss := !self_meta.hit
   io.status.bits.way := self_meta.way
   io.status.bits.way_reg := meta_reg.self.way  // used to ease timing issue
-  io.status.bits.will_grant_data := req.fromA && od.opcode(0) && io.tasks.source_d.bits.useBypass
+  // will_grant_data must be true BEFORE got_bypass_data so that inner_grant is asserted
+  // when LLC data arrives, enabling SinkD to write to RefillBuffer.
+  // od.useBypass already gates on got_bypass_data, so SourceD only reads after the write.
+  io.status.bits.will_grant_data := req.fromA && od.opcode(0) && bypass_miss_cond
   io.status.bits.will_save_data := req.fromA && (preferCache_latch || self_meta.hit) && !acquirePermMiss
   io.status.bits.is_prefetch := req.isPrefetch.getOrElse(false.B)
   io.status.bits.blockB := true.B

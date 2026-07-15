@@ -5,6 +5,7 @@ import chisel3._
 import chisel3.util._
 import freechips.rocketchip.tilelink._
 import huancun._
+import utility.MemReqSource
 
 class SinkC(implicit p: Parameters) extends BaseSinkC {
   /*
@@ -69,6 +70,8 @@ class SinkC(implicit p: Parameters) extends BaseSinkC {
   io.alloc.bits.dirty := c.bits.echo.lift(DirtyKey).getOrElse(true.B)
   io.alloc.bits.fromProbeHelper := false.B
   io.alloc.bits.fromCmoHelper := false.B
+  io.alloc.bits.isHit := true.B // ignored for inclusive
+  io.alloc.bits.reqSource := MemReqSource.NoWhere.id.U // ignored for inclusive
 
   if (cacheParams.enableDebug) {
     when(c.fire) {
@@ -146,4 +149,7 @@ class SinkC(implicit p: Parameters) extends BaseSinkC {
   io.resp.bits.last := last
   io.resp.bits.set := set
   io.resp.bits.bufIdx := DontCare // not used in inclusive cache
+
+  io.taskack.bits.sink := RegNext(task_r.source)
+  io.taskack.valid := RegNext(busy_r && (w_done || busy_r && task_r.drop), false.B)
 }

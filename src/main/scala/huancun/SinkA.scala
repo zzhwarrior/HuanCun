@@ -104,7 +104,7 @@ class SinkA(implicit p: Parameters) extends HuanCunModule {
   allocInfo.alias.foreach(_ := a.bits.user.lift(AliasKey).getOrElse(0.U))
   // allocInfo.preferCache := Mux((a.bits.opcode === TLMessages.Get || a.bits.opcode(2,1) === 0.U), true.B, a.bits.user.lift(PreferCacheKey).getOrElse(true.B))
   if (cacheParams.level == 2) {
-    allocInfo.preferCache := a.bits.user.lift(PreferCacheKey).getOrElse(true.B)
+    allocInfo.preferCache := a.bits.user.lift(PreferCacheKey).getOrElse(false.B)
   } else {
     allocInfo.preferCache := Mux((a.bits.opcode === TLMessages.Get || a.bits.opcode(2,1) === 0.U), true.B, a.bits.user.lift(PreferCacheKey).getOrElse(true.B))
   }

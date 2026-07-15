@@ -115,10 +115,10 @@ case class HCCacheParameters
   simulation: Boolean = false,
   innerBuf: TLBufferParams = TLBufferParams(),
   outerBuf: TLBufferParams = TLBufferParams(
-    a = BufferParams.default,
+    a = BufferParams.pipe,
     b = BufferParams.default,
     c = BufferParams.default,
-    d = BufferParams.default,
+    d = BufferParams.pipe,
     e = BufferParams.default
   ),
   FPGAPlatform: Boolean = false
