@@ -122,9 +122,8 @@ case class HCCacheParameters
     e = BufferParams.default
   ),
   FPGAPlatform: Boolean = false,
-  // TCM parameters: cacheWays=0 means use all `ways` for cache (no TCM)
-  cacheWays:   Int            = 0,
-  tcmWays:     Int            = 0,
+  // TCM: when tcmBaseAddr is defined, half the SRAM banks become TCM.
+  // nrStacks drops from 2 to 1, so cache capacity halves (effectiveCacheWays = ways / 2).
   tcmBaseAddr: Option[BigInt] = None
 ) {
   require(ways > 0)
@@ -134,14 +133,17 @@ case class HCCacheParameters
   if (!inclusive) {
     require(clientCaches.nonEmpty, "Non-inclusive cache need to know client cache information")
   }
-  require(cacheWays == 0 || cacheWays <= ways, "cacheWays must not exceed ways")
-  require(tcmWays == 0 || tcmBaseAddr.isDefined, "tcmBaseAddr must be set when tcmWays > 0")
+  require(!tcmEnabled || ways % 2 == 0, "ways must be even when TCM is enabled")
 
-  // Effective number of ways used by the cache SRAM (< ways when TCM is enabled)
-  def effectiveCacheWays: Int = if (cacheWays > 0) cacheWays else ways
+  def tcmEnabled: Boolean = tcmBaseAddr.isDefined
 
-  // TCM SRAM size in bytes (per bank/slice)
-  def tcmSizeBytes: Int = tcmWays * sets * blockBytes
+  // When TCM is enabled nrStacks=1, so the cache uses half as many banks and
+  // half as many ways to keep the physical SRAM depth unchanged.
+  def effectiveCacheWays: Int = if (tcmEnabled) ways / 2 else ways
+
+  // TCM SRAM capacity per bank/slice: same as the cache half it displaces.
+  // nrTcmBanks(=8) × bankBytes(=8) × nrTcmRows = effectiveCacheWays × sets × blockBytes
+  def tcmSizeBytes: Int = effectiveCacheWays * sets * blockBytes
 
   def toCacheParams: CacheParameters = CacheParameters(
     name = name,

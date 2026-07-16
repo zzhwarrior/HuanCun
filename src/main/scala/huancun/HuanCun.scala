@@ -50,8 +50,12 @@ trait HasHuanCunParameters {
   val mshrs = cacheParams.mshrs
   val mshrsAll = cacheParams.mshrs + 2
   val mshrBits = log2Up(mshrsAll)
+  // nrCacheStacks=1 when TCM enabled: cache uses 8 of the 16 banks, TCM takes the rest.
+  // effectiveCacheWays = ways/2 keeps the physical SRAM depth identical in both modes.
+  val tcmEnabled         = cacheParams.tcmEnabled
+  val nrCacheStacks      = if (tcmEnabled) 1 else 2
   val effectiveCacheWays = cacheParams.effectiveCacheWays
-  val blocks = effectiveCacheWays * cacheParams.sets
+  val blocks    = effectiveCacheWays * cacheParams.sets
   val sizeBytes = blocks * blockBytes
   val dirReadPorts = cacheParams.dirReadPorts
 
@@ -63,8 +67,7 @@ trait HasHuanCunParameters {
   val clientMaxWays = cacheParams.clientCaches.map(_.ways).fold(0)(math.max)
   val maxWays = math.max(clientMaxWays, effectiveCacheWays)
 
-  // TCM parameters
-  val tcmEnabled     = cacheParams.tcmWays > 0
+  // TCM parameters — capacity mirrors the cache half displaced by nrCacheStacks=1
   val tcmSizeBytes   = cacheParams.tcmSizeBytes
   val nrTcmBanks     = 8
   val nrTcmRows      = if (tcmEnabled) tcmSizeBytes / (nrTcmBanks * 8) else 1

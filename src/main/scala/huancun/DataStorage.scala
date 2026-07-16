@@ -51,8 +51,13 @@ class DataStorage(implicit p: Parameters) extends HuanCunModule {
   })
 
   /* Define some internal parameters */
-  val nrStacks = 2
-  val stackBits = log2Ceil(nrStacks)
+  // nrCacheStacks is 1 when TCM is enabled (8 cache banks) and 2 otherwise (16 cache banks).
+  // Reducing nrCacheStacks by half keeps the physical SRAM depth constant while freeing
+  // 8 banks for TCM.
+  val nrStacks = nrCacheStacks
+  // stackBits is clamped to ≥1 to avoid 0-width wire slices; the req() function
+  // handles the nrStacks==1 case explicitly and never uses this value as a slice width.
+  val stackBits = math.max(log2Ceil(nrStacks), 1)
   val bankBytes = 8
   val rowBytes = nrStacks * beatBytes
   val nrRows = sizeBytes / rowBytes
@@ -128,8 +133,9 @@ class DataStorage(implicit p: Parameters) extends HuanCunModule {
     // [beat, set, way, block] => [way, set, beat, block]
     //                            [index, stack, block]
     val innerAddr = Cat(addr.bits.way, addr.bits.set, addr.bits.beat)
-    val innerIndex = innerAddr >> stackBits
-    val stackIdx = innerAddr(stackBits - 1, 0)
+    // When nrStacks==1 there is no stack dimension: every request goes to stack 0.
+    val innerIndex = if (nrStacks == 1) innerAddr else innerAddr >> stackBits
+    val stackIdx   = if (nrStacks == 1) 0.U(1.W)  else innerAddr(stackBits - 1, 0)
     val stackSel = UIntToOH(stackIdx, stackSize) // Select which stack to access
 
     val out = Wire(new DSRequest)
