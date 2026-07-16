@@ -25,6 +25,13 @@ import chisel3.util._
 import huancun.utils.SRAMWrapper
 import utility._
 
+// Request bundle for TCM SRAM access
+class TCMReq(implicit p: Parameters) extends HuanCunBundle {
+  val wen   = Bool()
+  val row   = UInt(tcmRowBits.W)
+  val wdata = UInt((nrTcmBanks * 8 * 8).W)  // nrTcmBanks * bankBytes * 8 bits
+}
+
 class DataStorage(implicit p: Parameters) extends HuanCunModule {
   val io = IO(new Bundle() {
     val sourceC_raddr = Flipped(DecoupledIO(new DSAddress))
@@ -38,6 +45,9 @@ class DataStorage(implicit p: Parameters) extends HuanCunModule {
     val sinkC_waddr = Flipped(DecoupledIO(new DSAddress))
     val sinkC_wdata = Input(new DSData)
     val ecc = Valid(new EccInfo)
+    // TCM ports (only active when tcmEnabled)
+    val tcm_req   = if (tcmEnabled) Some(Flipped(DecoupledIO(new TCMReq))) else None
+    val tcm_rdata = if (tcmEnabled) Some(Output(UInt((nrTcmBanks * 8 * 8).W)))  else None
   })
 
   /* Define some internal parameters */
@@ -81,6 +91,19 @@ class DataStorage(implicit p: Parameters) extends HuanCunModule {
       ))
     }
   } else null
+
+  // Independent TCM SRAM banks (no stack interleave, all banks active simultaneously)
+  val tcmBankedData = if (tcmEnabled) {
+    val nrTcmRowsLocal = tcmSizeBytes / (nrTcmBanks * bankBytes)
+    Seq.fill(nrTcmBanks) {
+      Module(new SRAMWrapper(
+        gen          = UInt((8 * bankBytes).W),
+        set          = nrTcmRowsLocal,
+        n            = cacheParams.sramDepthDiv,
+        clk_div_by_2 = cacheParams.sramClkDivBy2
+      ))
+    }
+  } else Nil
 
   val stackRdy = if (cacheParams.sramClkDivBy2) {
     RegInit(VecInit(Seq.fill(nrStacks) {
@@ -265,6 +288,45 @@ class DataStorage(implicit p: Parameters) extends HuanCunModule {
 
   for (i <- 1 to nrStacks) {
     XSPerfAccumulate(s"DS_${i}_stacks_used", debug_stack_used === i.U)
+  }
+
+  // TCM SRAM control: all banks activate simultaneously, no arbitration
+  if (tcmEnabled) {
+    val tcmReq   = io.tcm_req.get
+    val tcmRdata = io.tcm_rdata.get
+    val tcmEn    = tcmReq.valid
+    val tcmRow   = tcmReq.bits.row
+
+    for (i <- 0 until nrTcmBanks) {
+      val bank = tcmBankedData(i)
+      if (cacheParams.sramClkDivBy2) {
+        // Write
+        bank.io.w.req.valid := RegNext(tcmEn && tcmReq.bits.wen, false.B)
+        bank.io.w.req.bits.apply(
+          setIdx  = RegNext(tcmRow),
+          data    = RegNext(tcmReq.bits.wdata(((i + 1) * 8 * bankBytes - 1), (i * 8 * bankBytes))),
+          waymask = 1.U
+        )
+        // Read
+        bank.io.r.req.valid := RegNext(tcmEn && !tcmReq.bits.wen, false.B)
+        bank.io.r.req.bits.apply(setIdx = RegNext(tcmRow))
+      } else {
+        // Write
+        bank.io.w.req.valid := tcmEn && tcmReq.bits.wen
+        bank.io.w.req.bits.apply(
+          setIdx  = tcmRow,
+          data    = tcmReq.bits.wdata(((i + 1) * 8 * bankBytes - 1), (i * 8 * bankBytes)),
+          waymask = 1.U
+        )
+        // Read
+        bank.io.r.req.valid := tcmEn && !tcmReq.bits.wen
+        bank.io.r.req.bits.apply(setIdx = tcmRow)
+      }
+    }
+
+    // TCM always ready; reads return data after SRAM latency (handled in Slice pipeline)
+    tcmReq.ready := true.B
+    tcmRdata := Cat(tcmBankedData.map(_.io.r.resp.data(0)).reverse)
   }
 
 }

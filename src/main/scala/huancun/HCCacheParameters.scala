@@ -121,7 +121,11 @@ case class HCCacheParameters
     d = BufferParams.pipe,
     e = BufferParams.default
   ),
-  FPGAPlatform: Boolean = false
+  FPGAPlatform: Boolean = false,
+  // TCM parameters: cacheWays=0 means use all `ways` for cache (no TCM)
+  cacheWays:   Int            = 0,
+  tcmWays:     Int            = 0,
+  tcmBaseAddr: Option[BigInt] = None
 ) {
   require(ways > 0)
   require(sets > 0)
@@ -130,11 +134,19 @@ case class HCCacheParameters
   if (!inclusive) {
     require(clientCaches.nonEmpty, "Non-inclusive cache need to know client cache information")
   }
+  require(cacheWays == 0 || cacheWays <= ways, "cacheWays must not exceed ways")
+  require(tcmWays == 0 || tcmBaseAddr.isDefined, "tcmBaseAddr must be set when tcmWays > 0")
+
+  // Effective number of ways used by the cache SRAM (< ways when TCM is enabled)
+  def effectiveCacheWays: Int = if (cacheWays > 0) cacheWays else ways
+
+  // TCM SRAM size in bytes (per bank/slice)
+  def tcmSizeBytes: Int = tcmWays * sets * blockBytes
 
   def toCacheParams: CacheParameters = CacheParameters(
     name = name,
     sets = sets,
-    ways = ways,
+    ways = effectiveCacheWays,
     blockGranularity = log2Ceil(sets),
     blockBytes = blockBytes,
     inner = clientCaches
@@ -146,3 +158,5 @@ case object EdgeInKey extends Field[TLEdgeIn]
 case object EdgeOutKey extends Field[TLEdgeOut]
 
 case object BankBitsKey extends Field[Int]
+
+case object BankIdKey extends Field[Int](0)

@@ -197,13 +197,18 @@ class Directory(implicit p: Parameters)
 
   def selfHitFn(dir: SelfDirEntry): Bool = dir.state =/= MetaData.INVALID
   def self_invalid_way_sel(metaVec: Seq[SelfDirEntry], repl: UInt): (Bool, UInt) = {
-    // 1.try to find a invalid way
-    val invalid_vec = metaVec.map(_.state === MetaData.INVALID)
+    val cacheWays = cacheParams.effectiveCacheWays
+    // 1.try to find an invalid way (only within cache way range)
+    val invalid_vec = metaVec.zipWithIndex.map {
+      case (m, i) => m.state === MetaData.INVALID && (i < cacheWays).B
+    }
     val has_invalid_way = Cat(invalid_vec).orR
     val invalid_way = ParallelPriorityMux(invalid_vec.zipWithIndex.map(x => x._1 -> x._2.U(wayBits.W)))
     // 2.if there is no invalid way, then try to find a TRUNK to replace
     // (we are non-inclusive, if we are trunk, there must be a TIP in our client)
-    val trunk_vec = metaVec.map(_.state === MetaData.TRUNK)
+    val trunk_vec = metaVec.zipWithIndex.map {
+      case (m, i) => m.state === MetaData.TRUNK && (i < cacheWays).B
+    }
     val has_trunk_way = Cat(trunk_vec).orR
     val trunk_way = ParallelPriorityMux(trunk_vec.zipWithIndex.map(x => x._1 -> x._2.U(wayBits.W)))
     val repl_way_is_trunk = VecInit(metaVec)(repl).state === MetaData.TRUNK
@@ -216,7 +221,7 @@ class Directory(implicit p: Parameters)
     new SubDirectoryDoUpdate[SelfDirEntry](
       wports = mshrsAll,
       sets = cacheParams.sets,
-      ways = cacheParams.ways,
+      ways = cacheParams.effectiveCacheWays,
       tagBits = tagBits,
       dir_init_fn = () => {
         val init = Wire(new SelfDirEntry())

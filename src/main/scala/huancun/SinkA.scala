@@ -36,6 +36,9 @@ class SinkA(implicit p: Parameters) extends HuanCunModule {
     // SourceA
     val a_pb_pop = Flipped(DecoupledIO(new PutBufferPop))
     val a_pb_beat = Output(new PutBufferBeatEntry)
+    // TCM write path
+    val tcm_pb_pop  = Flipped(DecoupledIO(new PutBufferPop))
+    val tcm_pb_beat = Output(new PutBufferBeatEntry)
   })
 
   // TODO: Does task for SinkA necessary?
@@ -125,5 +128,11 @@ class SinkA(implicit p: Parameters) extends HuanCunModule {
   io.a_pb_beat := RegEnable(putBuffer(io.a_pb_pop.bits.bufIdx)(io.a_pb_pop.bits.count), io.a_pb_pop.fire)
   when(io.a_pb_pop.fire && io.a_pb_pop.bits.last) {
     beatVals(io.a_pb_pop.bits.bufIdx).foreach(_ := false.B)
+  }
+
+  io.tcm_pb_pop.ready := beatVals(io.tcm_pb_pop.bits.bufIdx)(io.tcm_pb_pop.bits.count)
+  io.tcm_pb_beat := RegEnable(putBuffer(io.tcm_pb_pop.bits.bufIdx)(io.tcm_pb_pop.bits.count), io.tcm_pb_pop.fire)
+  when(io.tcm_pb_pop.fire && io.tcm_pb_pop.bits.last) {
+    beatVals(io.tcm_pb_pop.bits.bufIdx).foreach(_ := false.B)
   }
 }

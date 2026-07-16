@@ -50,17 +50,26 @@ trait HasHuanCunParameters {
   val mshrs = cacheParams.mshrs
   val mshrsAll = cacheParams.mshrs + 2
   val mshrBits = log2Up(mshrsAll)
-  val blocks = cacheParams.ways * cacheParams.sets
+  val effectiveCacheWays = cacheParams.effectiveCacheWays
+  val blocks = effectiveCacheWays * cacheParams.sets
   val sizeBytes = blocks * blockBytes
   val dirReadPorts = cacheParams.dirReadPorts
 
-  val wayBits = log2Ceil(cacheParams.ways)
+  val wayBits = log2Ceil(effectiveCacheWays)
   val setBits = log2Ceil(cacheParams.sets)
   val offsetBits = log2Ceil(blockBytes)
   val beatBits = offsetBits - log2Ceil(beatBytes)
   val pageOffsetBits = log2Ceil(cacheParams.pageBytes)
   val clientMaxWays = cacheParams.clientCaches.map(_.ways).fold(0)(math.max)
-  val maxWays = math.max(clientMaxWays, cacheParams.ways)
+  val maxWays = math.max(clientMaxWays, effectiveCacheWays)
+
+  // TCM parameters
+  val tcmEnabled     = cacheParams.tcmWays > 0
+  val tcmSizeBytes   = cacheParams.tcmSizeBytes
+  val nrTcmBanks     = 8
+  val nrTcmRows      = if (tcmEnabled) tcmSizeBytes / (nrTcmBanks * 8) else 1
+  val tcmRowBits     = if (tcmEnabled) log2Ceil(nrTcmRows) else 1
+  val tcmBaseAddrOpt = cacheParams.tcmBaseAddr
 
   val stateBits = MetaData.stateBits
 
@@ -90,6 +99,7 @@ trait HasHuanCunParameters {
   lazy val edgeIn = p(EdgeInKey)
   lazy val edgeOut = p(EdgeOutKey)
   lazy val bankBits = p(BankBitsKey)
+  lazy val bankId   = p(BankIdKey)
 
   lazy val clientBits = edgeIn.client.clients.count(_.supports.probe)
   lazy val sourceIdBits = edgeIn.bundle.sourceBits
@@ -370,6 +380,7 @@ class HuanCun(implicit p: Parameters) extends LazyModule with HasHuanCunParamete
           case EdgeInKey  => edgeIn
           case EdgeOutKey => edgeOut
           case BankBitsKey => bankBits
+          case BankIdKey   => i
         })) }
         slice.io.in <> in
         in.b.bits.address := restoreAddress(slice.io.in.b.bits.address, i)
