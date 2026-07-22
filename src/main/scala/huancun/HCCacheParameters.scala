@@ -21,8 +21,8 @@ package huancun
 
 import org.chipsalliance.cde.config.Field
 import chisel3._
-import chisel3.util.log2Ceil
-import freechips.rocketchip.diplomacy.BufferParams
+import chisel3.util.{isPow2, log2Ceil}
+import freechips.rocketchip.diplomacy.{AddressSet, BufferParams}
 import freechips.rocketchip.tilelink.{TLBufferParams, TLChannelBeatBytes, TLEdgeIn, TLEdgeOut}
 import freechips.rocketchip.util.{BundleField, BundleFieldBase, BundleKeyBase, ControlKey}
 import huancun.prefetch.{PrefetchParameters, TPmetaParameters}
@@ -123,8 +123,12 @@ case class HCCacheParameters
   ),
   FPGAPlatform: Boolean = false,
   // TCM: when tcmBaseAddr is defined, half the SRAM banks become TCM.
-  // nrStacks drops from 2 to 1, so cache capacity halves (effectiveCacheWays = ways / 2).
-  tcmBaseAddr: Option[BigInt] = None
+  // Since the dual-port refactor, tcmBaseAddr denotes the base address of the
+  // dedicated tcmNode's address region, not a filter inside the cache pipeline.
+  tcmBaseAddr: Option[BigInt] = None,
+  // Explicit TCM capacity (bytes). When None, falls back to the legacy derivation
+  // where TCM mirrors the displaced cache half (effectiveCacheWays * sets * blockBytes).
+  tcmSizeBytesOpt: Option[Int] = None
 ) {
   require(ways > 0)
   require(sets > 0)
@@ -134,6 +138,12 @@ case class HCCacheParameters
     require(clientCaches.nonEmpty, "Non-inclusive cache need to know client cache information")
   }
   require(!tcmEnabled || ways % 2 == 0, "ways must be even when TCM is enabled")
+  if (tcmEnabled) {
+    require(isPow2(tcmSizeBytes),
+      s"tcmSizeBytes ($tcmSizeBytes) must be a power of 2 for Diplomacy AddressSet")
+    require(tcmBaseAddr.get % tcmSizeBytes == 0,
+      s"tcmBaseAddr (0x${tcmBaseAddr.get.toString(16)}) must be aligned to tcmSizeBytes ($tcmSizeBytes)")
+  }
 
   def tcmEnabled: Boolean = tcmBaseAddr.isDefined
 
@@ -141,9 +151,14 @@ case class HCCacheParameters
   // half as many ways to keep the physical SRAM depth unchanged.
   def effectiveCacheWays: Int = if (tcmEnabled) ways / 2 else ways
 
-  // TCM SRAM capacity per bank/slice: same as the cache half it displaces.
-  // nrTcmBanks(=8) × bankBytes(=8) × nrTcmRows = effectiveCacheWays × sets × blockBytes
-  def tcmSizeBytes: Int = effectiveCacheWays * sets * blockBytes
+  // TCM SRAM capacity per bank/slice. Explicit override wins; otherwise mirrors
+  // the cache half it displaces.
+  def tcmSizeBytes: Int =
+    tcmSizeBytesOpt.getOrElse(effectiveCacheWays * sets * blockBytes)
+
+  // Diplomacy address range served by tcmNode.
+  def tcmAddressSet: Option[AddressSet] =
+    tcmBaseAddr.map(base => AddressSet(base, tcmSizeBytes - 1))
 
   def toCacheParams: CacheParameters = CacheParameters(
     name = name,

@@ -40,6 +40,10 @@ class Slice()(implicit p: Parameters) extends HuanCunModule {
     val ctl_resp = DecoupledIO(new CtrlResp())
     val ctl_ecc = DecoupledIO(new EccInfo())
     val l3Miss = Output(Bool())
+    // External TCM interface — driven by TcmSinkA at the HuanCun top level
+    // after the dual-port refactor. Present only when TCM is enabled.
+    val tcm_ext_req   = if (tcmEnabled) Some(Flipped(DecoupledIO(new TCMReq))) else None
+    val tcm_ext_rdata = if (tcmEnabled) Some(Output(UInt((nrTcmBanks * 8 * 8).W))) else None
   })
   println(s"clientBits: $clientBits")
 
@@ -64,11 +68,10 @@ class Slice()(implicit p: Parameters) extends HuanCunModule {
   val sinkE = Module(new SinkE)
 
   val inBuf = cacheParams.innerBuf
-  sinkA.io.a <> inBuf.a(io.in.a)
+  sinkA.io.a <> inBuf.a(io.in.a)                    // cache A goes straight to SinkA
   io.in.b <> inBuf.b(sourceB.io.b)
   sinkC.io.c <> inBuf.c(io.in.c)
-  // D channel will be connected after TCM pipeline vars are declared (see below)
-  val inBufD = inBuf.d(sourceD.io.d)
+  io.in.d <> inBuf.d(sourceD.io.d)                  // cache D goes straight out
   sinkE.io.e <> inBuf.e(io.in.e)
 
   // Outer channles
@@ -132,238 +135,23 @@ class Slice()(implicit p: Parameters) extends HuanCunModule {
   }
 
   // -----------------------------------------------------------------------
-  // TCM bypass pipeline
+  // TCM SRAM ports — driven by TcmSinkA at the HuanCun top level via the
+  // slice's external tcm_ext_* interface. The cache path (SinkA/SourceD) has
+  // no involvement with TCM traffic any more.
   // -----------------------------------------------------------------------
-  // Detect whether an A-channel request targets the TCM address range.
-  // When TCM is enabled, we intercept such requests before they reach the
-  // MSHR allocator and handle them in a short fixed-latency pipeline.
-  def isTcmRequest(tag: UInt, set: UInt): Bool = {
-    if (!tcmEnabled || tcmBaseAddrOpt.isEmpty) {
-      false.B
-    } else {
-      // Reconstruct the full physical address from the slice-local tag/set
-      // by reinserting the bank-index bits that parseAddress stripped.
-      val sliceHighBits = Cat(tag, set)                           // tag:set without bank/offset
-      val fullAddrNoOff = Cat(sliceHighBits, bankId.U(bankBits.W)) // reinsert bank bits
-      val fullAddr      = Cat(fullAddrNoOff, 0.U(offsetBits.W))
-      val tcmBase  = tcmBaseAddrOpt.get.U(fullAddr.getWidth.W)
-      val tcmTop   = (tcmBaseAddrOpt.get + tcmSizeBytes).U(fullAddr.getWidth.W)
-      fullAddr >= tcmBase && fullAddr < tcmTop
-    }
+  if (tcmEnabled) {
+    dataStorage.io.tcm_req.get <> io.tcm_ext_req.get
+    io.tcm_ext_rdata.get       := dataStorage.io.tcm_rdata.get
   }
 
-  // Convert a slice-local (tag, set) to a TCM SRAM row number.
-  def tcmRow(tag: UInt, set: UInt): UInt = {
-    if (!tcmEnabled || tcmBaseAddrOpt.isEmpty) 0.U(tcmRowBits.W)
-    else {
-      val sliceHighBits = Cat(tag, set)
-      val fullAddrNoOff = Cat(sliceHighBits, bankId.U(bankBits.W))
-      val fullAddr      = Cat(fullAddrNoOff, 0.U(offsetBits.W))
-      val offset        = fullAddr - tcmBaseAddrOpt.get.U(fullAddr.getWidth.W)
-      // Each TCM row is nrTcmBanks*bankBytes = 64 bytes (offsetBits wide)
-      offset(offset.getWidth - 1, offsetBits)(tcmRowBits - 1, 0)
-    }
-  }
-
-  // Entry saved through the TCM read pipeline
-  class TcmInflight extends Bundle {
-    val valid  = Bool()
-    val source = UInt(sourceIdBits.W)
-    val size   = UInt(edgeIn.bundle.sizeBits.W)
-  }
-
-  // Intercept sinkA alloc before it reaches a_req
   val a_req = Wire(DecoupledIO(new MSHRRequest()))
 
-  val tcmInFlight = if (tcmEnabled) {
-    // Pipeline registers tracking in-flight TCM reads (depth = sramLatency)
-    val regs = RegInit(VecInit(Seq.fill(sramLatency)(0.U.asTypeOf(new TcmInflight))))
-    Some(regs)
-  } else None
-
-  // TCM write: accepted in 1 cycle, response next cycle
-  val tcmWrRespValid = RegInit(false.B)
-  val tcmWrRespSrc   = Reg(UInt(sourceIdBits.W))
-  val tcmWrRespSize  = Reg(UInt(edgeIn.bundle.sizeBits.W))
-
-  // TCM read response hold register: captures pipeline output until D-channel can accept.
-  // Prevents silent response loss when the arbiter gives priority to cache SourceD in the
-  // same cycle that the read pipeline reaches its last stage.
-  val tcmRdHoldValid = RegInit(false.B)
-  val tcmRdHoldSrc   = Reg(UInt(sourceIdBits.W))
-  val tcmRdHoldSize  = Reg(UInt(edgeIn.bundle.sizeBits.W))
-  val tcmRdHoldData  = Reg(UInt((nrTcmBanks * 8 * 8).W))
-  // Tracks whether a read is anywhere in the pipeline OR in the hold register.
-  // Set the cycle tcmReadAccept fires; cleared when the D-channel fires the response.
-  // This keeps the pipeline to strictly one read at a time, preventing the collision
-  // where a second pipeline output arrives on the same cycle the first hold fires.
-  val tcmRdOccupied  = RegInit(false.B)
-
-  if (tcmEnabled) {
-    val sinkAAlloc = sinkA.io.alloc
-    val isTcm      = isTcmRequest(sinkAAlloc.bits.tag, sinkAAlloc.bits.set)
-    val isWrite    = sinkAAlloc.bits.opcode(2, 1) === 0.U  // PutFull/PutPartial
-
-    // ----------------------------------------------------------------
-    // TCM write state machine
-    // Collects all beats from SinkA put-buffer then fires SRAM write.
-    // ----------------------------------------------------------------
-    val beats = blockBytes / beatBytes  // beats per cache line (e.g. 8)
-
-    val tcmWrIdle :: tcmWrCollect :: tcmWrCaptureWait :: tcmWrFire :: Nil = Enum(4)
-    val tcmWrState   = RegInit(tcmWrIdle)
-    val tcmWrBufIdx  = Reg(UInt(bufIdxBits.W))
-    val tcmWrCount   = RegInit(0.U(beatBits.W))
-    val tcmWrDataVec = Reg(Vec(beats, UInt((beatBytes * 8).W)))
-    val tcmWrRow     = Reg(UInt(tcmRowBits.W))
-    val tcmWrSrc     = Reg(UInt(sourceIdBits.W))
-    val tcmWrSizeReg = Reg(UInt(edgeIn.bundle.sizeBits.W))
-
-    // Wire up the dedicated TCM pop port on SinkA
-    val tcmPbPop  = sinkA.io.tcm_pb_pop
-    val tcmPbBeat = sinkA.io.tcm_pb_beat
-
-    tcmPbPop.valid       := false.B
-    tcmPbPop.bits.bufIdx := tcmWrBufIdx
-    tcmPbPop.bits.count  := tcmWrCount
-    tcmPbPop.bits.last   := tcmWrCount === (beats - 1).U
-
-    // Capture beat data one cycle after pop fires (RegEnable delay in SinkA)
-    val capturePrev      = RegNext(tcmPbPop.fire, false.B)
-    val capturePrevCount = RegNext(tcmWrCount, 0.U)
-    when(capturePrev) {
-      tcmWrDataVec(capturePrevCount) := tcmPbBeat.data
-    }
-
-    switch(tcmWrState) {
-      is(tcmWrCollect) {
-        tcmPbPop.valid := true.B
-        when(tcmPbPop.fire) {
-          tcmWrCount := tcmWrCount + 1.U
-          when(tcmPbPop.bits.last) {
-            // Last beat popped; wait one cycle for RegEnable in SinkA to deliver beat data
-            tcmWrState := tcmWrCaptureWait
-          }
-        }
-      }
-      is(tcmWrCaptureWait) {
-        // Beat data for the last beat appears this cycle via RegEnable; next cycle it is in tcmWrDataVec
-        tcmWrState := tcmWrFire
-      }
-      is(tcmWrFire) {
-        // All beat data now in tcmWrDataVec; issue SRAM write and return to idle
-        tcmWrState := tcmWrIdle
-      }
-    }
-
-    // Reads: allowed only when no read is already in flight (pipeline or hold register).
-    // Writes: only start a new one when state machine is idle
-    val tcmReadAccept  = sinkAAlloc.valid && isTcm && !isWrite && (tcmWrState =/= tcmWrFire) && !tcmRdOccupied
-    val tcmWriteAccept = sinkAAlloc.valid && isTcm &&  isWrite && (tcmWrState === tcmWrIdle)
-    // Mark pipeline occupied the moment a read is accepted
-    when(tcmReadAccept) { tcmRdOccupied := true.B }
-    // Start write state machine on alloc
-    when(tcmWriteAccept) {
-      tcmWrBufIdx  := sinkAAlloc.bits.bufIdx
-      tcmWrRow     := tcmRow(sinkAAlloc.bits.tag, sinkAAlloc.bits.set)
-      tcmWrSrc     := sinkAAlloc.bits.source
-      tcmWrSizeReg := sinkAAlloc.bits.size
-      tcmWrCount   := 0.U
-      tcmWrState   := tcmWrCollect
-    }
-
-    // Gate sinkA.alloc → a_req: only forward non-TCM requests
-    a_req.valid := sinkAAlloc.valid && !isTcm
-    a_req.bits  := sinkAAlloc.bits
-    sinkAAlloc.ready := Mux(isTcm,
-      Mux(isWrite,
-        tcmWrState === tcmWrIdle,
-        (tcmWrState =/= tcmWrFire) && !tcmRdOccupied),
-      a_req.ready)
-
-    // Issue TCM SRAM request: write fires in tcmWrFire; read fires on tcmReadAccept
-    val tcmReqOpt = dataStorage.io.tcm_req.get
-    tcmReqOpt.valid      := (tcmWrState === tcmWrFire) || tcmReadAccept
-    tcmReqOpt.bits.wen   := tcmWrState === tcmWrFire
-    tcmReqOpt.bits.row   := Mux(tcmWrState === tcmWrFire,
-                               tcmWrRow,
-                               tcmRow(sinkAAlloc.bits.tag, sinkAAlloc.bits.set))
-    tcmReqOpt.bits.wdata := Cat(tcmWrDataVec.reverse)  // all beats valid in FIRE state
-
-    // TCM read pipeline: shift in-flight record through sramLatency stages
-    val inf = tcmInFlight.get
-    inf(0).valid  := tcmReadAccept
-    inf(0).source := sinkAAlloc.bits.source
-    inf(0).size   := sinkAAlloc.bits.size
-    for (i <- 1 until sramLatency) {
-      inf(i) := inf(i - 1)
-    }
-
-    // TCM write response: AccessAck in the same cycle as SRAM write (FIRE state)
-    tcmWrRespValid := tcmWrState === tcmWrFire
-    tcmWrRespSrc   := tcmWrSrc
-    tcmWrRespSize  := tcmWrSizeReg
-  }
-
-  // TCM D-channel injection (placed here so all TCM vars are already declared)
-  if (tcmEnabled) {
-    val rdInf    = tcmInFlight.get
-    val rdData   = dataStorage.io.tcm_rdata.get
-
-    // Capture the pipeline output into the hold register whenever it is valid.
-    // The hold register keeps the response stable until the D-channel arbiter
-    // accepts it, preventing the silent drop that occurs when cache SourceD wins
-    // arbitration in the same cycle the read pipeline exits.
-    when(rdInf.last.valid) {
-      tcmRdHoldValid := true.B
-      tcmRdHoldSrc   := rdInf.last.source
-      tcmRdHoldSize  := rdInf.last.size
-      tcmRdHoldData  := rdData
-    }
-
-    val tcmD = Wire(DecoupledIO(io.in.d.bits.cloneType))
-    tcmD.valid       := tcmRdHoldValid || tcmWrRespValid
-    tcmD.bits        := DontCare
-    tcmD.bits.opcode := Mux(tcmRdHoldValid, TLMessages.AccessAckData, TLMessages.AccessAck)
-    tcmD.bits.param  := 0.U
-    tcmD.bits.size   := Mux(tcmRdHoldValid, tcmRdHoldSize, tcmWrRespSize)
-    tcmD.bits.source := Mux(tcmRdHoldValid, tcmRdHoldSrc,  tcmWrRespSrc)
-    tcmD.bits.sink   := 0.U
-    tcmD.bits.denied := false.B
-    tcmD.bits.data   := tcmRdHoldData
-    tcmD.bits.corrupt := false.B
-
-    // Clear the hold register once the D-channel fires the read response.
-    // Also release the pipeline occupancy flag so the next read can be accepted.
-    when(tcmD.fire && tcmRdHoldValid) {
-      tcmRdHoldValid := false.B
-      tcmRdOccupied  := false.B
-    }
-
-    val dArb = Module(new Arbiter(io.in.d.bits.cloneType, 2))
-    dArb.io.in(0) <> inBufD          // cache SourceD has higher priority
-    dArb.io.in(1) <> tcmD
-    io.in.d <> dArb.io.out
-  } else {
-    io.in.d <> inBufD
-  }
-  // For non-TCM path, connect a_req to sinkA.alloc accounting for probeHelper
-  if(cacheParams.inclusive){
-    if (!tcmEnabled) { a_req <> sinkA.io.alloc }
+  if (cacheParams.inclusive) {
+    a_req <> sinkA.io.alloc
     mshrAlloc.io.b_req <> sinkB.io.alloc
   } else {
     val probeHelper = probeHelperOpt.get
-    if (!tcmEnabled) {
-      block_decoupled(a_req, sinkA.io.alloc, probeHelper.io.full)
-    } else {
-      // TCM enabled: a_req is already driven from the TCM intercept block above.
-      // We still need to propagate the probeHelper block signal.
-      // a_req.valid was set to sinkAAlloc.valid && !isTcm; additionally gate by !probeHelper.io.full
-      // We create a local override – Chisel last-connect wins.
-      val baseValid = !isTcmRequest(sinkA.io.alloc.bits.tag, sinkA.io.alloc.bits.set) &&
-                      sinkA.io.alloc.valid && !probeHelper.io.full
-      a_req.valid := baseValid
-    }
+    block_decoupled(a_req, sinkA.io.alloc, probeHelper.io.full)
     val b_arb = Module(new Arbiter(new MSHRRequest, 2))
     b_arb.io.in(0) <> probeHelper.io.probe
     b_arb.io.in(1) <> sinkB.io.alloc
@@ -826,14 +614,6 @@ class Slice()(implicit p: Parameters) extends HuanCunModule {
 
   sinkA.io.a_pb_pop <> sourceA.io.pb_pop
   sinkA.io.a_pb_beat <> sourceA.io.pb_beat
-
-  // TCM pop port: driven by state machine above when tcmEnabled, otherwise tied off
-  if (!tcmEnabled) {
-    sinkA.io.tcm_pb_pop.valid       := false.B
-    sinkA.io.tcm_pb_pop.bits.bufIdx := 0.U
-    sinkA.io.tcm_pb_pop.bits.count  := 0.U
-    sinkA.io.tcm_pb_pop.bits.last   := false.B
-  }
 
   val tag_err = RegNext(Cat(ms.map(m => m.io.ecc.valid)).orR, false.B)
   val tag_err_info = RegNext(MuxCase(

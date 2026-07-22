@@ -214,13 +214,23 @@ class HuanCun(implicit p: Parameters) extends LazyModule with HasHuanCunParamete
     responseKeys = cacheParams.respKey
   )
 
-  val node = TLAdapterNode(
+  // Cache TL adapter node. When TCM is enabled the manager address filter
+  // subtracts the TCM region so upstream Xbars never route TCM traffic here —
+  // TCM has its own tcmNode below (a plain TLManagerNode) that the tile binds
+  // directly to its tlMasterXbar as a second, fully-independent TL port.
+  val cacheNode = TLAdapterNode(
     clientFn = { _ => clientPortParams },
     managerFn = { m =>
       TLSlavePortParameters.v1(
-        m.managers.map { m =>
+        m.managers.flatMap { m =>
           val canCache = m.regionType >= RegionType.UNCACHED
-          m.v2copy(
+          val filteredAddrs = cacheParams.tcmAddressSet match {
+            case Some(tcmSet) => m.address.flatMap(_.subtract(tcmSet))
+            case None         => m.address
+          }
+          if (filteredAddrs.isEmpty) None
+          else Some(m.v2copy(
+            address    = filteredAddrs,
             regionType = if (canCache) RegionType.CACHED else m.regionType,
             supports = TLMasterToSlaveTransferSizes(
               acquireB = if (canCache) xfer else TransferSizes.none,
@@ -233,7 +243,7 @@ class HuanCun(implicit p: Parameters) extends LazyModule with HasHuanCunParamete
               hint = if (m.supportsHint) access else TransferSizes.none
             ),
             fifoId = None
-          )
+          ))
         },
         beatBytes = cacheParams.channelBytes.d.get,
         minLatency = 2,
@@ -244,7 +254,29 @@ class HuanCun(implicit p: Parameters) extends LazyModule with HasHuanCunParamete
     }
   )
 
-  val ctrl_unit = cacheParams.ctrl.map(_ => LazyModule(new CtrlUnit(node)))
+  // Compatibility alias — many call-sites still reference `wrapper.node`.
+  def node: TLAdapterNode = cacheNode
+
+  // Dedicated TCM manager node. Second independent TL port on HuanCun; the
+  // tile binds it directly to tlMasterXbar so cache and TCM traffic never
+  // share a channel. UNCACHED slave — no Acquire, only Get/Put.
+  val tcmNode: Option[TLManagerNode] = cacheParams.tcmAddressSet.map { addr =>
+    TLManagerNode(Seq(TLSlavePortParameters.v1(
+      managers = Seq(TLSlaveParameters.v1(
+        address            = Seq(addr),
+        regionType         = RegionType.UNCACHED,
+        executable         = true,
+        supportsGet        = TransferSizes(1, blockBytes),
+        supportsPutFull    = TransferSizes(1, blockBytes),
+        supportsPutPartial = TransferSizes(1, blockBytes),
+        fifoId             = Some(0)
+      )),
+      beatBytes  = beatBytes,
+      minLatency = 2
+    )))
+  }
+
+  val ctrl_unit = cacheParams.ctrl.map(_ => LazyModule(new CtrlUnit(cacheNode)))
   val ctlnode = ctrl_unit.map(_.ctlnode)
   val rst_nodes = ctrl_unit.map(_.core_reset_nodes)
   val intnode = ctrl_unit.map(_.intnode)
@@ -419,6 +451,33 @@ class HuanCun(implicit p: Parameters) extends LazyModule with HasHuanCunParamete
         io.perfEvents(i) := slice.perfinfo
         slice
     }
+
+    // -----------------------------------------------------------------------
+    // Second TL port: tcmNode → TcmSinkA → slice(0).io.tcm_ext_* → TcmSourceD.
+    // Independent from the cacheNode path; single-slice assumption for now.
+    // -----------------------------------------------------------------------
+    wrapper.tcmNode.foreach { tcmN =>
+      require(slices.nonEmpty, "TCM enabled but no slices instantiated")
+      require(tcmN.in.size == 1, "TCM node currently supports a single upstream edge")
+      val (tcmIn, tcmEdgeIn) = tcmN.in.head
+      val tcmP = p.alterPartial {
+        case EdgeInKey   => tcmEdgeIn
+        case EdgeOutKey  => wrapper.node.out.head._2
+        case BankBitsKey => 0                    // single-slice, no bank interleave
+        case BankIdKey   => 0
+      }
+      val tcmSinkA   = Module(new TcmSinkA(cacheParams.tcmBaseAddr.get)(tcmP))
+      val tcmSourceD = Module(new TcmSourceD()(tcmP))
+
+      tcmSinkA.io.a      <> tcmIn.a
+      tcmIn.d            <> tcmSourceD.io.d
+      tcmSourceD.io.resp <> tcmSinkA.io.resp
+
+      // Bridge to slice(0)'s TCM SRAM interface.
+      slices.head.io.tcm_ext_req.get <> tcmSinkA.io.tcm_req
+      tcmSinkA.io.tcm_rdata          := slices.head.io.tcm_ext_rdata.get
+    }
+
     val ecc_arb = Module(new Arbiter(new EccInfo, slices.size))
     val slices_ecc = slices.zipWithIndex.map {
       case (s, i) => Pipeline(s.io.ctl_ecc, depth = 2, pipe = false, name = Some(s"ecc_buffer_$i"))
