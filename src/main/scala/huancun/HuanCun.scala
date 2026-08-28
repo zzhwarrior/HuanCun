@@ -50,10 +50,11 @@ trait HasHuanCunParameters {
   val mshrs = cacheParams.mshrs
   val mshrsAll = cacheParams.mshrs + 2
   val mshrBits = log2Up(mshrsAll)
-  // nrCacheStacks=1 when TCM enabled: cache uses 8 of the 16 banks, TCM takes the rest.
-  // effectiveCacheWays = ways/2 keeps the physical SRAM depth identical in both modes.
+  // Storage geometry — always 2 stacks of stackSize banks now, regardless of
+  // whether TCM is enabled. The unified bank pool is shared by cache and TCM
+  // via runtime way-mode masking (see tcmWayMask below).
   val tcmEnabled         = cacheParams.tcmEnabled
-  val nrCacheStacks      = if (tcmEnabled) 1 else 2
+  val nrCacheStacks      = 2
   val effectiveCacheWays = cacheParams.effectiveCacheWays
   val blocks    = effectiveCacheWays * cacheParams.sets
   val sizeBytes = blocks * blockBytes
@@ -67,11 +68,16 @@ trait HasHuanCunParameters {
   val clientMaxWays = cacheParams.clientCaches.map(_.ways).fold(0)(math.max)
   val maxWays = math.max(clientMaxWays, effectiveCacheWays)
 
-  // TCM parameters — capacity mirrors the cache half displaced by nrCacheStacks=1
+  // TCM parameters. Under the unified-bank refactor, TCM occupies the top
+  // 'tcmWayCount' ways of the shared SRAM pool. tcmWayMask is a compile-time
+  // one-hot-ish mask (top N bits set) used by the cache directory to exclude
+  // those ways from lookup/replacement. A later step replaces this with a
+  // runtime CSR-driven wire.
   val tcmSizeBytes   = cacheParams.tcmSizeBytes
-  val nrTcmBanks     = 8
-  val nrTcmRows      = if (tcmEnabled) tcmSizeBytes / (nrTcmBanks * 8) else 1
-  val tcmRowBits     = if (tcmEnabled) log2Ceil(nrTcmRows) else 1
+  val tcmWayCount    = cacheParams.tcmWayCount
+  // Bit i set ⇒ way i is TCM. TCM is contiguous at the top: ways [ways-N, ways).
+  val tcmWayMask: BigInt = if (tcmWayCount == 0) BigInt(0)
+    else ((BigInt(1) << tcmWayCount) - 1) << (effectiveCacheWays - tcmWayCount)
   val tcmBaseAddrOpt = cacheParams.tcmBaseAddr
 
   val stateBits = MetaData.stateBits
@@ -276,6 +282,21 @@ class HuanCun(implicit p: Parameters) extends LazyModule with HasHuanCunParamete
     )))
   }
 
+  // TCM partition control (Step 2A). Present iff a control-region base was
+  // configured. The wrapper (WithHuanCunL2) attaches ctrlNode to PBUS; inside
+  // HuanCunImp we wire its way_mask output to every Slice.
+  val tcmCtrl: Option[TcmCtrl] = (cacheParams.tcmCtrlBaseAddr, cacheParams.tcmEnabled) match {
+    case (Some(base), true) => Some(LazyModule(new TcmCtrl(
+      params          = TcmCtrlParams(ctrlAddress = base),
+      ways            = effectiveCacheWays,
+      sets            = cacheParams.sets,
+      blockBytes      = blockBytes,
+      initTcmWayCount = cacheParams.tcmWayCount
+    )))
+    case _ => None
+  }
+  val tcmCtrlNode: Option[TLRegisterNode] = tcmCtrl.map(_.ctrlNode)
+
   val ctrl_unit = cacheParams.ctrl.map(_ => LazyModule(new CtrlUnit(cacheNode)))
   val ctlnode = ctrl_unit.map(_.ctlnode)
   val rst_nodes = ctrl_unit.map(_.core_reset_nodes)
@@ -455,7 +476,20 @@ class HuanCun(implicit p: Parameters) extends LazyModule with HasHuanCunParamete
     // -----------------------------------------------------------------------
     // Second TL port: tcmNode → TcmSinkA → slice(0).io.tcm_ext_* → TcmSourceD.
     // Independent from the cacheNode path; single-slice assumption for now.
+    // The optional TcmCtrl module (see wrapper.tcmCtrl) provides the runtime
+    // way_mask; when absent we fall back to a compile-time-fixed mask.
     // -----------------------------------------------------------------------
+    val tcmWayMaskSig: UInt = wrapper.tcmCtrl match {
+      case Some(ctrl) => ctrl.module.io.way_mask
+      case None       =>
+        // Fall back to the Step-1 compile-time mask (all zeros when TCM off).
+        WireDefault(tcmWayMask.U(effectiveCacheWays.W))
+    }
+    // Drive every slice's runtime mask input from the shared signal.
+    slices.foreach { s =>
+      s.io.tcm_way_mask.foreach(_ := tcmWayMaskSig)
+    }
+
     wrapper.tcmNode.foreach { tcmN =>
       require(slices.nonEmpty, "TCM enabled but no slices instantiated")
       require(tcmN.in.size == 1, "TCM node currently supports a single upstream edge")
@@ -469,9 +503,10 @@ class HuanCun(implicit p: Parameters) extends LazyModule with HasHuanCunParamete
       val tcmSinkA   = Module(new TcmSinkA(cacheParams.tcmBaseAddr.get)(tcmP))
       val tcmSourceD = Module(new TcmSourceD()(tcmP))
 
-      tcmSinkA.io.a      <> tcmIn.a
-      tcmIn.d            <> tcmSourceD.io.d
-      tcmSourceD.io.resp <> tcmSinkA.io.resp
+      tcmSinkA.io.a           <> tcmIn.a
+      tcmIn.d                 <> tcmSourceD.io.d
+      tcmSourceD.io.resp      <> tcmSinkA.io.resp
+      tcmSinkA.io.tcm_way_mask := tcmWayMaskSig
 
       // Bridge to slice(0)'s TCM SRAM interface.
       slices.head.io.tcm_ext_req.get <> tcmSinkA.io.tcm_req

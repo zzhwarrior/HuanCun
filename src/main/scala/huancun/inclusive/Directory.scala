@@ -41,13 +41,16 @@ class DirectoryIO(implicit p: Parameters) extends BaseDirectoryIO[DirResult, Dir
   val result = ValidIO(new DirResult)
   val dirWReq = Flipped(DecoupledIO(new DirWrite))
   val tagWReq = Flipped(DecoupledIO(new TagWrite))
+  // tcm_way_mask is inherited from BaseDirectoryIO (inclusive path ignores it).
 }
 
 class Directory(implicit p: Parameters) extends BaseDirectory[DirResult, DirWrite, TagWrite] {
 
   val io = IO(new DirectoryIO())
 
-  def invalid_way_sel(metaVec: Seq[DirectoryEntry], repl: UInt) = {
+  def invalid_way_sel(metaVec: Seq[DirectoryEntry], repl: UInt, mask: UInt) = {
+    // Inclusive path currently ignores the runtime way-mask (no TCM support
+    // wired here). mask is accepted only to match the SubDirectory signature.
     val invalid_vec = metaVec.map(_.state === MetaData.INVALID)
     val has_invalid_way = Cat(invalid_vec).orR
     val way = ParallelPriorityMux(invalid_vec.zipWithIndex.map(x => x._1 -> x._2.U(wayBits.W)))
@@ -71,6 +74,8 @@ class Directory(implicit p: Parameters) extends BaseDirectory[DirResult, DirWrit
       replacement = cacheParams.replacement
     ) with UpdateOnAcquire
   )
+  // Inclusive path has no TCM support; tie the runtime way-mask off.
+  dir.io.way_mask := 0.U
   val rport = dir.io.read
   val req = io.read
   rport.valid := req.valid

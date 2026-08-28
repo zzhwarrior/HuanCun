@@ -43,7 +43,11 @@ class Slice()(implicit p: Parameters) extends HuanCunModule {
     // External TCM interface — driven by TcmSinkA at the HuanCun top level
     // after the dual-port refactor. Present only when TCM is enabled.
     val tcm_ext_req   = if (tcmEnabled) Some(Flipped(DecoupledIO(new TCMReq))) else None
-    val tcm_ext_rdata = if (tcmEnabled) Some(Output(UInt((nrTcmBanks * 8 * 8).W))) else None
+    val tcm_ext_rdata = if (tcmEnabled) Some(Output(UInt((beatBytes * 8).W))) else None
+    // Runtime TCM way-mask (bit i set ⇒ way i is TCM). Driven by TcmCtrl at
+    // the top level; both the cache directory and TcmSinkA consume this so
+    // the partition can shift dynamically. Present only when TCM is enabled.
+    val tcm_way_mask  = if (tcmEnabled) Some(Input(UInt(effectiveCacheWays.W))) else None
   })
   println(s"clientBits: $clientBits")
 
@@ -397,6 +401,10 @@ class Slice()(implicit p: Parameters) extends HuanCunModule {
     if (cacheParams.inclusive) new inclusive.Directory()
     else new noninclusive.Directory()
   })
+  // Wire the runtime TCM way-mask. When TCM is enabled the top-level HuanCun
+  // module drives io.tcm_way_mask from TcmCtrl.module.io.way_mask; otherwise
+  // tie it off. Inclusive Directory ignores the value internally.
+  directory.io.tcm_way_mask := (if (tcmEnabled) io.tcm_way_mask.get else 0.U)
   directory.io.read <> ctrl_arb(mshrAlloc.io.dirRead, ctrl.map(_.io.dir_read))
   ctrl.map(c => {
     c.io.dir_result.valid := directory.io.result.valid && directory.io.result.bits.idOH(1, 0) === "b11".U

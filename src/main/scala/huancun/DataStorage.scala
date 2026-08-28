@@ -25,11 +25,19 @@ import chisel3.util._
 import huancun.utils.SRAMWrapper
 import utility._
 
-// Request bundle for TCM SRAM access
+// Request bundle for TCM SRAM access. Under the unified-bank layout, TCM
+// addresses translate to a (way, set) pair before entering DataStorage —
+// TcmSinkA owns that translation. wdata is a single stack's width (= one
+// beat) since one TCM beat touches exactly one stack. wmask is a per-bank
+// write-enable within the target stack: bit i set ⇒ bank i's 8 bytes will
+// be updated, bit i clear ⇒ bank i's contents are preserved (RMW behaviour
+// for aligned sub-beat writes). All-ones for full 64B writes (e.g. DMA).
 class TCMReq(implicit p: Parameters) extends HuanCunBundle {
   val wen   = Bool()
-  val row   = UInt(tcmRowBits.W)
-  val wdata = UInt((nrTcmBanks * 8 * 8).W)  // nrTcmBanks * bankBytes * 8 bits
+  val way   = UInt(wayBits.W)
+  val set   = UInt(setBits.W)
+  val wdata = UInt((beatBytes * 8).W)
+  val wmask = UInt((beatBytes / 8).W)   // one bit per 8-byte bank; = stackSize
 }
 
 class DataStorage(implicit p: Parameters) extends HuanCunModule {
@@ -45,9 +53,12 @@ class DataStorage(implicit p: Parameters) extends HuanCunModule {
     val sinkC_waddr = Flipped(DecoupledIO(new DSAddress))
     val sinkC_wdata = Input(new DSData)
     val ecc = Valid(new EccInfo)
-    // TCM ports (only active when tcmEnabled)
+    // TCM port (only active when tcmEnabled). Under the unified-bank layout
+    // TCM requests join the same 6-way arbiter as cache requests; the read
+    // response comes back through a dedicated selector so it doesn't share
+    // sourceD/sourceC read-data paths.
     val tcm_req   = if (tcmEnabled) Some(Flipped(DecoupledIO(new TCMReq))) else None
-    val tcm_rdata = if (tcmEnabled) Some(Output(UInt((nrTcmBanks * 8 * 8).W)))  else None
+    val tcm_rdata = if (tcmEnabled) Some(Output(UInt((beatBytes * 8).W)))   else None
   })
 
   /* Define some internal parameters */
@@ -97,18 +108,9 @@ class DataStorage(implicit p: Parameters) extends HuanCunModule {
     }
   } else null
 
-  // Independent TCM SRAM banks (no stack interleave, all banks active simultaneously)
-  val tcmBankedData = if (tcmEnabled) {
-    val nrTcmRowsLocal = tcmSizeBytes / (nrTcmBanks * bankBytes)
-    Seq.fill(nrTcmBanks) {
-      Module(new SRAMWrapper(
-        gen          = UInt((8 * bankBytes).W),
-        set          = nrTcmRowsLocal,
-        n            = cacheParams.sramDepthDiv,
-        clk_div_by_2 = cacheParams.sramClkDivBy2
-      ))
-    }
-  } else Nil
+  // TCM shares 'bankedData' with the cache side; it is admitted into the
+  // per-stack arbiter as an additional highest-priority request source (see
+  // reqs sequence below). No separate SRAM instances exist any more.
 
   val stackRdy = if (cacheParams.sramClkDivBy2) {
     RegInit(VecInit(Seq.fill(nrStacks) {
@@ -126,9 +128,14 @@ class DataStorage(implicit p: Parameters) extends HuanCunModule {
     val bankSum = UInt(nrBanks.W)
     val bankEn = UInt(nrBanks.W)
     val data = Vec(nrBanks, UInt((8 * bankBytes).W))
+    // Per-bank write-enable mask, ANDed with the derived per-bank wen. Cache
+    // paths always set this to all-1s (full-line writes). TCM partial-beat
+    // writes narrow it down so only the byte-lanes covered by the TL a.mask
+    // actually update SRAM.
+    val bankWMask = UInt(nrBanks.W)
   }
 
-  def req(wen: Boolean, addr: DecoupledIO[DSAddress], data: DSData) = {
+  def req(wen: Bool, addr: DecoupledIO[DSAddress], data: DSData): DSRequest = {
     // Remap address
     // [beat, set, way, block] => [way, set, beat, block]
     //                            [index, stack, block]
@@ -148,7 +155,7 @@ class DataStorage(implicit p: Parameters) extends HuanCunModule {
     )
     addr.ready := accessVec(stackIdx) && stackRdy(stackIdx)
 
-    out.wen := wen.B
+    out.wen := wen
     out.index := innerIndex
     // FillInterleaved: 0010 => 00000000 00000000 11111111 00000000
     out.bankSel := Mux(addr.valid, FillInterleaved(stackSize, stackSel), 0.U) // TODO: consider mask
@@ -157,28 +164,143 @@ class DataStorage(implicit p: Parameters) extends HuanCunModule {
       out.bankSel & FillInterleaved(stackSize, accessVec)
     )
     out.data := Cat(Seq.fill(nrStacks)(data.data)).asTypeOf(out.data.cloneType)
+    // Cache paths never do partial writes: full cacheline replace only.
+    out.bankWMask := ~0.U(nrBanks.W)
     out
   }
 
   /* Arbitrates r&w by bank according to priority */
-  val sourceC_req = req(wen = false, io.sourceC_raddr, io.sourceC_rdata)
-  val sourceD_rreq = req(wen = false, io.sourceD_raddr, io.sourceD_rdata)
-  val sourceD_wreq = req(wen = true, io.sourceD_waddr, io.sourceD_wdata)
-  val sinkD_wreq = req(wen = true, io.sinkD_waddr, io.sinkD_wdata)
-  val sinkC_req = req(wen = true, io.sinkC_waddr, io.sinkC_wdata)
+  val sourceC_req = req(false.B, io.sourceC_raddr, io.sourceC_rdata)
+  val sourceD_rreq = req(false.B, io.sourceD_raddr, io.sourceD_rdata)
+  val sourceD_wreq = req(true.B, io.sourceD_waddr, io.sourceD_wdata)
+  val sinkD_wreq   = req(true.B, io.sinkD_waddr, io.sinkD_wdata)
+  val sinkC_req    = req(true.B, io.sinkC_waddr, io.sinkC_wdata)
 
-  val reqs =
-    Seq(
-      sourceC_req,
-      sinkC_req,
-      sinkD_wreq,
-      sourceD_wreq,
-      sourceD_rreq
-    ) // TODO: add more requests with priority carefully
-  reqs.foldLeft(0.U(nrBanks.W)) {
-    case (sum, req) =>
-      req.bankSum := sum
-      req.bankSel | sum
+  // TCM: build a DSAddress-shaped wire from the TCMReq bundle and reuse req().
+  // TCM is placed at the *highest* priority in the reqs sequence so scratchpad
+  // access has deterministic latency (a Step-3 anti-starvation counter on the
+  // cache sources will keep cache from being locked out on the same stack).
+  val tcm_req_opt: Option[DSRequest] = if (tcmEnabled) {
+    val tr    = io.tcm_req.get
+    val addrW = Wire(DecoupledIO(new DSAddress))
+    val dataW = Wire(new DSData)
+    addrW.valid       := tr.valid
+    addrW.bits.way    := tr.bits.way
+    addrW.bits.set    := tr.bits.set
+    addrW.bits.beat   := 0.U
+    addrW.bits.write  := tr.bits.wen
+    addrW.bits.noop   := false.B
+    tr.ready          := addrW.ready
+    dataW.data        := tr.bits.wdata
+    dataW.corrupt     := false.B
+    val ds = req(tr.bits.wen, addrW, dataW)
+    // Narrow bankWMask to the byte-lane mask. TL a.bits.mask is per-byte;
+    // TcmSinkA has already OR-reduced it to per-8B-bank (= stackSize bits).
+    // A TCM request only targets one stack (chosen via set[0]) so we place
+    // wmask at the correct stack's bank positions and leave the other stack
+    // as zero. Cache stack: banks [0..stackSize); other: banks [stackSize..).
+    if (nrStacks == 2) {
+      val stackIdx = tr.bits.set(0)
+      val wmaskLo  = Mux(stackIdx, 0.U(stackSize.W), tr.bits.wmask)
+      val wmaskHi  = Mux(stackIdx, tr.bits.wmask,   0.U(stackSize.W))
+      ds.bankWMask := Cat(wmaskHi, wmaskLo)
+    } else {
+      // nrStacks==1: no stack dimension, all banks are one stack.
+      ds.bankWMask := tr.bits.wmask
+    }
+    Some(ds)
+  } else None
+
+  val cacheReqs = Seq(sourceC_req, sinkC_req, sinkD_wreq, sourceD_wreq, sourceD_rreq)
+  val reqs = tcm_req_opt.toSeq ++ cacheReqs
+    // TODO: add more requests with priority carefully
+
+  // ---------------------------------------------------------------------
+  // Priority arbitration + Step-3 anti-starvation.
+  //
+  // Default fold order (highest first): TCM, sourceC, sinkC, sinkD_w,
+  // sourceD_w, sourceD_r. Each req sees the OR-union of higher-priority
+  // bankSels as its bankSum, and stalls if its own bankSel overlaps.
+  //
+  // Anti-starvation (only when TCM is present): each cache source runs a
+  // saturating counter of consecutive cycles it has been asserting valid
+  // without firing. When a source hits WAIT_MAX, we let it "steal" one
+  // cycle from TCM by (a) removing tcm.bankSel from that source's bankSum
+  // so it fires, and (b) injecting the starved source's bankSel into
+  // tcm.bankSum so TCM stalls in exactly the banks it would have taken.
+  //
+  // Different-stack traffic is untouched: TCM keeps stack X while a
+  // starved cache source proceeds on stack Y. Only same-stack conflicts
+  // are re-arbitrated.
+  // ---------------------------------------------------------------------
+
+  private val StarvationWaitMax = 16
+  private val cacheAddrPorts = Seq(
+    io.sourceC_raddr, io.sinkC_waddr, io.sinkD_waddr, io.sourceD_waddr, io.sourceD_raddr
+  )
+
+  // Per-cache-source saturating stall counters. cnt increments while the
+  // port asserts valid but doesn't fire; resets on fire or when valid drops.
+  val starvedFlags: Seq[Bool] = cacheAddrPorts.map { port =>
+    val cnt = RegInit(0.U(log2Ceil(StarvationWaitMax + 1).W))
+    when(port.fire || !port.valid) {
+      cnt := 0.U
+    }.elsewhen(cnt < StarvationWaitMax.U) {
+      cnt := cnt + 1.U
+    }
+    cnt === StarvationWaitMax.U
+  }
+
+  // Precompute default (unadjusted) bankSums for each req from the static
+  // priority order — done as a plain Scala fold so we can override.
+  private val defaultBankSums: Seq[UInt] = {
+    val builder = collection.mutable.ArrayBuffer[UInt]()
+    var running: UInt = 0.U(nrBanks.W)
+    reqs.foreach { r =>
+      builder += running
+      running = running | r.bankSel
+    }
+    builder.toSeq
+  }
+
+  if (tcmEnabled) {
+    val tcm = tcm_req_opt.get
+    // Which banks are being "stolen" from TCM this cycle by starved cache.
+    val starvedClaim = cacheReqs.zip(starvedFlags).map {
+      case (r, s) => Mux(s, r.bankSel, 0.U(nrBanks.W))
+    }.reduce(_ | _)
+
+    // *** DIAGNOSTIC: force anti-starvation off ***
+    // Set to `true.B` to disable Step 3 anti-starvation entirely (TCM sees
+    // an empty bankSum as if it were still the highest-priority source, and
+    // cache reqs see the default fold). If matmul passes with this toggled
+    // on, Step 3 is the culprit for the mt>=1 (or nt>=1) failures.
+    val disableAntiStarve = true.B
+
+    // TCM sees the stolen banks as if a higher-priority source claimed
+    // them, so TCM stalls exactly on those banks.
+    tcm.bankSum := Mux(disableAntiStarve, 0.U(nrBanks.W), starvedClaim)
+
+    // Cache sources see their default bankSum, but starved ones exclude
+    // TCM's bankSel so they can slip past it.
+    cacheReqs.zip(starvedFlags).zipWithIndex.foreach {
+      case ((r, s), i) =>
+        // reqs = [tcm, cache0, cache1, ...], so cache i is at index i+1.
+        val defaultSum = defaultBankSums(i + 1)
+        r.bankSum := Mux(disableAntiStarve, defaultSum,
+                         Mux(s, defaultSum & ~tcm.bankSel, defaultSum))
+    }
+  } else {
+    // No TCM: plain fold assignments.
+    reqs.zip(defaultBankSums).foreach { case (r, s) => r.bankSum := s }
+  }
+
+  // Debug perf counters — count how often anti-starvation kicks in.
+  if (tcmEnabled) {
+    starvedFlags.zip(cacheAddrPorts).zipWithIndex.foreach {
+      case ((s, port), i) =>
+        XSPerfAccumulate(s"DS_starve_promote_$i", s && port.valid && port.ready)
+    }
   }
 
   val outData = Wire(Vec(nrBanks, UInt((8 * bankBytes).W)))
@@ -205,8 +327,9 @@ class DataStorage(implicit p: Parameters) extends HuanCunModule {
     bank_en(i) := en
     sel_req(i) := selectedReq
     if (cacheParams.sramClkDivBy2) {
-      // Write
-      val wen = en && selectedReq.wen
+      // Write — gated additionally by the per-bank write mask so TCM partial
+      // writes (byte-lane mask from TL) leave untouched banks intact.
+      val wen = en && selectedReq.wen && selectedReq.bankWMask(i)
       val wen_latch = RegNext(wen, false.B)
       bankedData(i).io.w.req.valid := wen_latch
       bankedData(i).io.w.req.bits.apply(
@@ -220,8 +343,8 @@ class DataStorage(implicit p: Parameters) extends HuanCunModule {
       bankedData(i).io.r.req.valid := ren_latch
       bankedData(i).io.r.req.bits.apply(setIdx = RegNext(selectedReq.index))
     } else {
-      // Write
-      val wen = en && selectedReq.wen
+      // Write — gated by bankWMask for partial-beat TCM writes.
+      val wen = en && selectedReq.wen && selectedReq.bankWMask(i)
       bankedData(i).io.w.req.valid := wen
       bankedData(i).io.w.req.bits.apply(
         setIdx = selectedReq.index,
@@ -258,13 +381,19 @@ class DataStorage(implicit p: Parameters) extends HuanCunModule {
   } else {
   }
 
+  // DataSel output ports:
+  //   0: sourceD read data
+  //   1: sourceC read data
+  //   2: (optional) TCM read data — only present when tcmEnabled
+  private val dataSelOutNum = if (tcmEnabled) 3 else 2
   val dataSelModules = Array.fill(stackSize) {
-    Module(new DataSel(nrStacks, 2, bankBytes * 8, eccBits))
+    Module(new DataSel(nrStacks, dataSelOutNum, bankBytes * 8, eccBits))
   }
   val data_grps = outData.grouped(stackSize).toList.transpose
   val ecc_grps = eccData.map(_.toList.transpose)
   val d_sel = sourceD_rreq.bankEn.asBools.grouped(stackSize).toList.transpose
   val c_sel = sourceC_req.bankEn.asBools.grouped(stackSize).toList.transpose
+  val t_sel = tcm_req_opt.map(_.bankEn.asBools.grouped(stackSize).toList.transpose)
   for (i <- 0 until stackSize) {
     val dataSel = dataSelModules(i)
     dataSel.io.in := VecInit(data_grps(i))
@@ -273,12 +402,20 @@ class DataStorage(implicit p: Parameters) extends HuanCunModule {
     dataSel.io.sel(1) := Cat(c_sel(i).reverse)
     dataSel.io.en(0) := io.sourceD_raddr.fire
     dataSel.io.en(1) := io.sourceC_raddr.fire
+    if (tcmEnabled) {
+      dataSel.io.sel(2) := Cat(t_sel.get(i).reverse)
+      // Only reads consume the DataSel read pipeline
+      dataSel.io.en(2)  := io.tcm_req.get.fire && !io.tcm_req.get.bits.wen
+    }
   }
 
   io.sourceD_rdata.data := Cat(dataSelModules.map(_.io.out(0)).reverse.toIndexedSeq)
   io.sourceD_rdata.corrupt := Cat(dataSelModules.map(_.io.err_out(0)).toIndexedSeq).orR
   io.sourceC_rdata.data := Cat(dataSelModules.map(_.io.out(1)).reverse.toIndexedSeq)
   io.sourceC_rdata.corrupt := Cat(dataSelModules.map(_.io.err_out(1)).toIndexedSeq).orR
+  if (tcmEnabled) {
+    io.tcm_rdata.get := Cat(dataSelModules.map(_.io.out(2)).reverse.toIndexedSeq)
+  }
 
   val d_addr_reg = RegNextN(io.sourceD_raddr.bits, sramLatency)
   val c_addr_reg = RegNextN(io.sourceC_raddr.bits, sramLatency)
@@ -294,45 +431,6 @@ class DataStorage(implicit p: Parameters) extends HuanCunModule {
 
   for (i <- 1 to nrStacks) {
     XSPerfAccumulate(s"DS_${i}_stacks_used", debug_stack_used === i.U)
-  }
-
-  // TCM SRAM control: all banks activate simultaneously, no arbitration
-  if (tcmEnabled) {
-    val tcmReq   = io.tcm_req.get
-    val tcmRdata = io.tcm_rdata.get
-    val tcmEn    = tcmReq.valid
-    val tcmRow   = tcmReq.bits.row
-
-    for (i <- 0 until nrTcmBanks) {
-      val bank = tcmBankedData(i)
-      if (cacheParams.sramClkDivBy2) {
-        // Write
-        bank.io.w.req.valid := RegNext(tcmEn && tcmReq.bits.wen, false.B)
-        bank.io.w.req.bits.apply(
-          setIdx  = RegNext(tcmRow),
-          data    = RegNext(tcmReq.bits.wdata(((i + 1) * 8 * bankBytes - 1), (i * 8 * bankBytes))),
-          waymask = 1.U
-        )
-        // Read
-        bank.io.r.req.valid := RegNext(tcmEn && !tcmReq.bits.wen, false.B)
-        bank.io.r.req.bits.apply(setIdx = RegNext(tcmRow))
-      } else {
-        // Write
-        bank.io.w.req.valid := tcmEn && tcmReq.bits.wen
-        bank.io.w.req.bits.apply(
-          setIdx  = tcmRow,
-          data    = tcmReq.bits.wdata(((i + 1) * 8 * bankBytes - 1), (i * 8 * bankBytes)),
-          waymask = 1.U
-        )
-        // Read
-        bank.io.r.req.valid := tcmEn && !tcmReq.bits.wen
-        bank.io.r.req.bits.apply(setIdx = tcmRow)
-      }
-    }
-
-    // TCM always ready; reads return data after SRAM latency (handled in Slice pipeline)
-    tcmReq.ready := true.B
-    tcmRdata := Cat(tcmBankedData.map(_.io.r.resp.data(0)).reverse)
   }
 
 }

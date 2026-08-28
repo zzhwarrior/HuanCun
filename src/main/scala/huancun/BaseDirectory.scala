@@ -51,6 +51,10 @@ abstract class BaseDirectoryIO[T_RESULT <: BaseDirResult, T_DIR_W <: BaseDirWrit
   val result:  Valid[T_RESULT]
   val dirWReq: DecoupledIO[T_DIR_W]
   val tagWReq:  DecoupledIO[T_TAG_W]
+  // Runtime TCM way-mask driven by TcmCtrl (Step 2A). Noninclusive Directory
+  // uses it to steer self-way lookup/replacement; inclusive Directory ties
+  // it off internally. Sized to effectiveCacheWays so 1-bit-per-way.
+  val tcm_way_mask: UInt = Input(UInt(p(HCCacheParamsKey).effectiveCacheWays.W))
 }
 
 abstract class BaseDirectory[T_RESULT <: BaseDirResult, T_DIR_W <: BaseDirWrite, T_TAG_W <: BaseTagWrite](
@@ -66,7 +70,10 @@ class SubDirectory[T <: Data](
   tagBits:     Int,
   dir_init_fn: () => T,
   dir_hit_fn: T => Bool,
-  invalid_way_sel: (Seq[T], UInt) => (Bool, UInt),
+  // invalid_way_sel picks an eviction candidate. Third arg is a runtime
+  // way-mask (bit i set ⇒ way i is excluded, i.e. TCM). Callers that don't
+  // care about masking wire it to 0 externally.
+  invalid_way_sel: (Seq[T], UInt, UInt) => (Bool, UInt),
   replacement: String)(implicit p: Parameters)
     extends Module {
 
@@ -99,6 +106,8 @@ class SubDirectory[T <: Data](
       val way = UInt(wayBits.W)
       val dir = dir_init.cloneType
     }))
+    // Runtime way-mask (bit i = 1 ⇒ way i is TCM). Non-TCM callers tie 0.
+    val way_mask = Input(UInt(ways.W))
   })
 
   val clk_div_by_2 = p(HCCacheParamsKey).sramClkDivBy2
@@ -190,7 +199,7 @@ class SubDirectory[T <: Data](
   val hitVec = tagMatchVec.zip(metaValidVec).map(x => x._1 && x._2)
   val hitWay = OHToUInt(hitVec)
   val replaceWay = repl.get_replace_way(repl_state)
-  val (inv, invalidWay) = invalid_way_sel(metas, replaceWay)
+  val (inv, invalidWay) = invalid_way_sel(metas, replaceWay, io.way_mask)
   val chosenWay = Mux(inv, invalidWay, replaceWay)
 
   /* stage 0: io.read.fire
@@ -259,7 +268,7 @@ abstract class SubDirectoryDoUpdate[T <: Data](
   tagBits:     Int,
   dir_init_fn: () => T,
   dir_hit_fn:  T => Bool,
-  invalid_way_sel: (Seq[T], UInt) => (Bool, UInt),
+  invalid_way_sel: (Seq[T], UInt, UInt) => (Bool, UInt),
   replacement: String)(implicit p: Parameters)
     extends SubDirectory[T](
       wports, sets, ways, tagBits,

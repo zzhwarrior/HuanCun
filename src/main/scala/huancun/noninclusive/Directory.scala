@@ -115,6 +115,7 @@ class DirectoryIO(implicit p: Parameters) extends BaseDirectoryIO[DirResult, Sel
   val tagWReq = Flipped(DecoupledIO(new SelfTagWrite))
   val clientDirWReq = Flipped(DecoupledIO(new ClientDirWrite))
   val clientTagWreq = Flipped(DecoupledIO(new ClientTagWrite))
+  // tcm_way_mask is inherited from BaseDirectoryIO.
 }
 
 class Directory(implicit p: Parameters)
@@ -170,7 +171,8 @@ class Directory(implicit p: Parameters)
     this.reset
   )
 
-  def client_invalid_way_fn(metaVec: Seq[Vec[ClientDirEntry]], repl: UInt): (Bool, UInt) = {
+  def client_invalid_way_fn(metaVec: Seq[Vec[ClientDirEntry]], repl: UInt, mask: UInt): (Bool, UInt) = {
+    // The client directory has no TCM concept; mask is unused.
     val invalid_vec = metaVec.map(states => Cat(states.map(_.state === INVALID)).andR)
     val has_invalid_way = Cat(invalid_vec).orR
     val way = ParallelPriorityMux(invalid_vec.zipWithIndex.map(x => x._1 -> x._2.U(clientWayBits.W)))
@@ -196,25 +198,39 @@ class Directory(implicit p: Parameters)
   )
 
   def selfHitFn(dir: SelfDirEntry): Bool = dir.state =/= MetaData.INVALID
-  def self_invalid_way_sel(metaVec: Seq[SelfDirEntry], repl: UInt): (Bool, UInt) = {
-    val cacheWays = cacheParams.effectiveCacheWays
+  def self_invalid_way_sel(metaVec: Seq[SelfDirEntry], repl: UInt, tcmMask: UInt): (Bool, UInt) = {
+    // Runtime TCM partition — bit i in tcmMask marks way i as TCM and thus
+    // off-limits to cache lookup / replacement. Under Step 2A the mask is
+    // written by software via the TcmCtrl MMIO regmap; under Step 1 it was
+    // a compile-time constant. The mask is threaded through SubDirectory's
+    // way_mask input port so no cross-module wire references are needed.
     // 1.try to find an invalid way (only within cache way range)
     val invalid_vec = metaVec.zipWithIndex.map {
-      case (m, i) => m.state === MetaData.INVALID && (i < cacheWays).B
+      case (m, i) => m.state === MetaData.INVALID && !tcmMask(i)
     }
     val has_invalid_way = Cat(invalid_vec).orR
     val invalid_way = ParallelPriorityMux(invalid_vec.zipWithIndex.map(x => x._1 -> x._2.U(wayBits.W)))
     // 2.if there is no invalid way, then try to find a TRUNK to replace
     // (we are non-inclusive, if we are trunk, there must be a TIP in our client)
     val trunk_vec = metaVec.zipWithIndex.map {
-      case (m, i) => m.state === MetaData.TRUNK && (i < cacheWays).B
+      case (m, i) => m.state === MetaData.TRUNK && !tcmMask(i)
     }
     val has_trunk_way = Cat(trunk_vec).orR
     val trunk_way = ParallelPriorityMux(trunk_vec.zipWithIndex.map(x => x._1 -> x._2.U(wayBits.W)))
-    val repl_way_is_trunk = VecInit(metaVec)(repl).state === MetaData.TRUNK
+    // 3.PLRU may propose a way index that lands in the TCM range; clip it
+    // deterministically to way 0 (always a cache way as long as bit 0 of
+    // tcmMask is 0). tcmWayCount ∈ {0,1,2,4,ways} keeps TCM contiguous at
+    // the top, so way 0 is a cache way unless the entire L2 is TCM
+    // (tcmWayCount = ways) — in which case cache is disabled and this
+    // branch is dead code.
+    val safeRepl = Mux(tcmMask(repl), 0.U(wayBits.W), repl)
+    val repl_way_is_trunk = VecInit(metaVec)(safeRepl).state === MetaData.TRUNK
+    // Always return "we have a choice": safeRepl is guaranteed non-TCM
+    // (except in the degenerate ways==tcmWayCount case).
     (
-      has_invalid_way || has_trunk_way,
-      Mux(has_invalid_way, invalid_way, Mux(repl_way_is_trunk, repl, trunk_way))
+      true.B,
+      Mux(has_invalid_way, invalid_way,
+        Mux(has_trunk_way, Mux(repl_way_is_trunk, safeRepl, trunk_way), safeRepl))
       )
   }
   val selfDir = Module(
@@ -234,6 +250,12 @@ class Directory(implicit p: Parameters)
       replacement = cacheParams.replacement
     ) with NonInclusiveCacheReplacerUpdate
   )
+
+  // Runtime way-mask plumbing. clientDir has no TCM concept — tie to 0.
+  // selfDir gets the mask from Directory's IO, which HuanCunImp drives from
+  // TcmCtrl.module.io.way_mask.
+  clientDir.io.way_mask := 0.U
+  selfDir.io.way_mask   := io.tcm_way_mask
 
   def addrConnect(lset: UInt, ltag: UInt, rset: UInt, rtag: UInt) = {
     assert(lset.getWidth + ltag.getWidth == rset.getWidth + rtag.getWidth)

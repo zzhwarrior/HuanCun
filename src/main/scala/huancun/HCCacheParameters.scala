@@ -122,13 +122,20 @@ case class HCCacheParameters
     e = BufferParams.default
   ),
   FPGAPlatform: Boolean = false,
-  // TCM: when tcmBaseAddr is defined, half the SRAM banks become TCM.
-  // Since the dual-port refactor, tcmBaseAddr denotes the base address of the
-  // dedicated tcmNode's address region, not a filter inside the cache pipeline.
+  // TCM: when tcmBaseAddr is defined, the top tcmWayCount ways of the unified
+  // SRAM pool are dedicated as scratchpad; the remaining ways serve as cache.
+  // tcmBaseAddr is the base of the tcmNode's Diplomacy address region.
   tcmBaseAddr: Option[BigInt] = None,
-  // Explicit TCM capacity (bytes). When None, falls back to the legacy derivation
-  // where TCM mirrors the displaced cache half (effectiveCacheWays * sets * blockBytes).
-  tcmSizeBytesOpt: Option[Int] = None
+  // Compile-time TCM way count. Must be one of {0, 1, 2, 4, ..., ways} (i.e.,
+  // ways or a power-of-2 ≤ ways). Defaults to ways/2 which matches the pre-
+  // refactor behaviour of "TCM mirrors the displaced cache half". This value
+  // is the *maximum* TCM allocation; a runtime CSR (added in a later step)
+  // will let software shrink it below this ceiling.
+  tcmWayCountOpt: Option[Int] = None,
+  // Base of the MMIO control region for runtime TCM partition (Step 2A).
+  // When None, no CSR module is instantiated and the partition is fixed at
+  // whatever tcmWayCountOpt resolves to.
+  tcmCtrlBaseAddr: Option[BigInt] = None
 ) {
   require(ways > 0)
   require(sets > 0)
@@ -139,6 +146,11 @@ case class HCCacheParameters
   }
   require(!tcmEnabled || ways % 2 == 0, "ways must be even when TCM is enabled")
   if (tcmEnabled) {
+    val n = tcmWayCount
+    require(n == 0 || n == ways || isPow2(n),
+      s"tcmWayCount ($n) must be 0, a power of 2, or equal to ways ($ways)")
+    require(n <= ways,
+      s"tcmWayCount ($n) must not exceed ways ($ways)")
     require(isPow2(tcmSizeBytes),
       s"tcmSizeBytes ($tcmSizeBytes) must be a power of 2 for Diplomacy AddressSet")
     require(tcmBaseAddr.get % tcmSizeBytes == 0,
@@ -147,16 +159,21 @@ case class HCCacheParameters
 
   def tcmEnabled: Boolean = tcmBaseAddr.isDefined
 
-  // When TCM is enabled nrStacks=1, so the cache uses half as many banks and
-  // half as many ways to keep the physical SRAM depth unchanged.
-  def effectiveCacheWays: Int = if (tcmEnabled) ways / 2 else ways
+  // Cache uses all physical ways; some may be masked off at runtime by the
+  // tcm_way_mask (see HuanCun.scala). Directory tag SRAMs are always sized
+  // for the full 'ways' count so the partition can shift dynamically later.
+  def effectiveCacheWays: Int = ways
 
-  // TCM SRAM capacity per bank/slice. Explicit override wins; otherwise mirrors
-  // the cache half it displaces.
-  def tcmSizeBytes: Int =
-    tcmSizeBytesOpt.getOrElse(effectiveCacheWays * sets * blockBytes)
+  // Max TCM way count. Defaults to ways/2 for backwards compatibility with
+  // the pre-refactor "half cache half TCM" layout.
+  def tcmWayCount: Int = tcmWayCountOpt.getOrElse(if (tcmEnabled) ways / 2 else 0)
 
-  // Diplomacy address range served by tcmNode.
+  // TCM SRAM capacity — derived from way count, not overridable separately.
+  def tcmSizeBytes: Int = tcmWayCount * sets * blockBytes
+
+  // Diplomacy address range served by tcmNode. Always sized to the maximum
+  // TCM capacity so the address map stays stable across runtime partition
+  // changes (see Step-3 discussion).
   def tcmAddressSet: Option[AddressSet] =
     tcmBaseAddr.map(base => AddressSet(base, tcmSizeBytes - 1))
 
