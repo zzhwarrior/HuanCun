@@ -148,6 +148,18 @@ class TcmSinkA(tcmAddressBase: BigInt)(implicit p: Parameters) extends HuanCunMo
 
   val acceptWrite = io.a.valid && first && isWrite && hasData && writeSlotFree
 
+  // Diagnostic: log every A-channel arrival at TcmSinkA and every response
+  // dequeue. Lets us see whether AME PutFullData actually reaches TCM and
+  // whether the resulting AccessAck goes out.
+  when(io.a.valid) {
+    printf(p"[TcmSinkA] a.valid=1 a.ready=${io.a.ready} first=${first} " +
+           p"opcode=${io.a.bits.opcode} isRead=${isRead} isWrite=${isWrite} " +
+           p"addr=${Hexadecimal(io.a.bits.address)} src=${io.a.bits.source} " +
+           p"size=${io.a.bits.size} way=${wayOf(io.a.bits.address)} " +
+           p"set=${setOf(io.a.bits.address)} outOfRange=${outOfRange(io.a.bits.address)} " +
+           p"activeTcmCount=${activeTcmCount}\n")
+  }
+
   // -----------------------------------------------------------------------
   // A-channel handshake
   //   * Read: only gated by the read pipeline being free. Writes never
@@ -223,13 +235,11 @@ class TcmSinkA(tcmAddressBase: BigInt)(implicit p: Parameters) extends HuanCunMo
   // -----------------------------------------------------------------------
   // Response emission
   //
-  // Writes now fire at up to 1 per cycle (was ~1 per 4 cycles), so we may
-  // occasionally collide with a read completion in the same cycle. Priority:
-  // read wins (has data), write ack goes into a 1-slot skid register and
-  // enqueues on the next available cycle. In DMA streaming there are no
-  // reads and the skid never engages.
+  // Writes fire at up to 1 per cycle so may collide with a read completion.
+  // Priority: read wins (has data), write ack goes into a 1-slot skid.
+  // See the skid-slot bookkeeping below for the drain-and-refill case.
   // -----------------------------------------------------------------------
-  val respQ = Module(new Queue(new TcmDResp, entries = 4))
+  val respQ = Module(new Queue(new TcmDResp, entries = 16))
   val rdComplete = inflight.last.valid
   val wrComplete = writeFires
 
@@ -253,18 +263,30 @@ class TcmSinkA(tcmAddressBase: BigInt)(implicit p: Parameters) extends HuanCunMo
   respQ.io.enq.bits.data   := io.tcm_rdata                  // valid this cycle when rdComplete
 
   // Skid-slot bookkeeping.
-  when(wrComplete && enqRead) {
-    // Both a fresh write ack and a read completed — read wins, latch write.
+  //
+  // Case table (what happens to pendingWrAck this cycle):
+  //   wrComplete=0 pendingWrAck=0                          : stays 0
+  //   wrComplete=1 pendingWrAck=0 enqRead=1                : latch fresh -> 1
+  //   wrComplete=1 pendingWrAck=0 enqRead=0                : enqWrite=1, drains directly, stays 0
+  //   wrComplete=0 pendingWrAck=1 enqRead=1                : blocked, stays 1
+  //   wrComplete=0 pendingWrAck=1 enqRead=0 respQ.ready=1  : old drains -> 0
+  //   wrComplete=1 pendingWrAck=1 enqRead=0 respQ.ready=1  : OLD drains AND FRESH must be
+  //                                                          latched — this is the case that
+  //                                                          was silently dropping fresh acks
+  //                                                          in the previous implementation.
+  //   wrComplete=1 pendingWrAck=1 enqRead=1                : 3-way conflict — real overflow.
+  val oldDrains      = pendingWrAck && enqWrite && respQ.io.enq.ready
+  val freshMustSkid  = wrComplete && (enqRead || pendingWrAck)
+  when(freshMustSkid) {
+    // Only unrecoverable overflow is when the skid is already occupied and
+    // can't drain this cycle. Anything else (either skid was empty OR skid
+    // was occupied but drains this cycle) fits in the single slot.
+    assert(!(pendingWrAck && !oldDrains),
+      "TcmSinkA: write-ack skid overflow (fresh + pending + no drain)")
     pendingWrAck    := true.B
     pendingWrAckSrc := wrSrcReg
     pendingWrAckSz  := wrSizeReg
-    // 3-way conflict (fresh write + read + old pending write) is not
-    // reachable: read completes at most once per sramLatency cycles, and
-    // during that gap the skid drains.
-    assert(!pendingWrAck,
-      "TcmSinkA: write-ack skid overflow (3-way response conflict)")
-  }.elsewhen(pendingWrAck && enqWrite && respQ.io.enq.ready) {
-    // Drained the skid this cycle.
+  }.elsewhen(oldDrains) {
     pendingWrAck := false.B
   }
 
@@ -276,4 +298,11 @@ class TcmSinkA(tcmAddressBase: BigInt)(implicit p: Parameters) extends HuanCunMo
     "TcmSinkA response queue overflow -- increase depth")
 
   io.resp <> respQ.io.deq
+
+  // Diagnostic: log response dequeue so we can see if the AccessAck for
+  // AME's PutFullData ever leaves TcmSinkA.
+  when(respQ.io.deq.fire) {
+    printf(p"[TcmSinkA] resp.fire isRead=${respQ.io.deq.bits.isRead} " +
+           p"src=${respQ.io.deq.bits.source} size=${respQ.io.deq.bits.size}\n")
+  }
 }
